@@ -2,8 +2,9 @@
 import torch
 
 class AttentionBasedPooling(torch.nn.Module):
-    def __init__(self, in_features):
+    def __init__(self, in_features, temp=1.0):
         super().__init__()
+        self.temp = temp
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(in_features=in_features, out_features=128),
             torch.nn.Tanh(),
@@ -16,7 +17,7 @@ class AttentionBasedPooling(torch.nn.Module):
         batch_size = len(lengths)
         
         attention_logits = self.mlp(x)
-        attention_weights = torch.cat([torch.nn.functional.softmax(weights_i, dim=0) for weights_i in torch.split(attention_logits, lengths)])
+        attention_weights = torch.cat([torch.nn.functional.softmax(weights_i/self.temp, dim=0) for weights_i in torch.split(attention_logits, lengths)])
         attention_weighted_x = attention_weights*x
         context_vectors = torch.cat([torch.sum(attention_weighted_x_i, dim=0, keepdim=True) for attention_weighted_x_i in torch.split(attention_weighted_x, lengths)])
         
