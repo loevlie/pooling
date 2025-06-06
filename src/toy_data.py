@@ -1,7 +1,5 @@
 import argparse
 import os
-import random
-import numpy as np
 import pandas as pd
 # PyTorch
 import torch
@@ -14,10 +12,15 @@ import utils
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description="toy_data.py")
     parser.add_argument("--alpha", default=0.0, help="TODO (default: 0.0)", type=float)
+    parser.add_argument("--beta", default=0.0, help="TODO (default: 0.0)", type=float)
     parser.add_argument("--batch_size", default=64, help="Batch size (default: 64)", type=int)
     parser.add_argument("--criterion", default="ERM", help="TODO (default: \"ERM\")", type=str)
+    parser.add_argument("--data_seed_test", default=2, help="TODO (default: 2)", type=int)
+    parser.add_argument("--data_seed_train", default=0, help="TODO (default: 0)", type=int)
+    parser.add_argument("--data_seed_val", default=1, help="TODO (default: 1)", type=int)
     parser.add_argument("--delta", default=1.0, help="TODO (default: 1.0)", type=float)
     parser.add_argument("--deltaS", default=1, help="TODO (default: 1)", type=int)
+    parser.add_argument("--embedding_level", action='store_true', default=False, help='Whether or not to use the embedding-level approach (default: False)')
     parser.add_argument("--epochs", default=1000, help="Number of epochs (default: 1000)", type=int)
     parser.add_argument("--experiments_directory", default="", help="Directory to save experiments (default: \"\")", type=str)
     parser.add_argument("--lr", default=0.01, help="Learning rate (default: 0.01)", type=float)
@@ -33,14 +36,12 @@ if __name__=="__main__":
     args = parser.parse_args()
     
     torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     
     os.makedirs(args.experiments_directory, exist_ok=True)
 
-    X_train, lengths_train, u_train, y_train = utils.generate_toy_data(args.N_train, delta=args.delta, deltaS=args.deltaS, seed=0)
-    X_val, lengths_val, u_val, y_val = utils.generate_toy_data(args.N_val, delta=args.delta, deltaS=args.deltaS, seed=1)
-    X_test, lengths_test, u_test, y_test = utils.generate_toy_data(args.N_test, delta=args.delta, deltaS=args.deltaS, seed=2)
+    X_train, lengths_train, u_train, y_train = utils.generate_toy_data(args.N_train, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_train)
+    X_val, lengths_val, u_val, y_val = utils.generate_toy_data(args.N_val, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_val)
+    X_test, lengths_test, u_test, y_test = utils.generate_toy_data(args.N_test, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_test)
     
     train_dataset = utils.ToyDataset(X_train, lengths_train, y_train)
     val_dataset = utils.ToyDataset(X_val, lengths_val, y_val)
@@ -54,8 +55,10 @@ if __name__=="__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(device)
     
-    # TODO: Init model, criterion, and optimizer
-    model = models.ClfPool(in_features=768, out_features=1, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
+    if args.embedding_level:
+        model = models.PoolClf(in_features=768, out_features=1, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
+    else:
+        model = models.ClfPool(in_features=768, out_features=1, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
     model.to(device)
         
     if args.criterion == "ERM":
@@ -64,6 +67,8 @@ if __name__=="__main__":
         criterion = losses.L1Loss(alpha=args.alpha, criterion=torch.nn.BCEWithLogitsLoss())
     elif args.criterion == "L2":
         criterion = losses.L2Loss(alpha=args.alpha, criterion=torch.nn.BCEWithLogitsLoss())
+    elif args.criterion == "GuidedL1":
+        criterion = losses.GuidedAttentionL1Loss(alpha=args.alpha, beta=args.beta, criterion=torch.nn.BCEWithLogitsLoss())
     else:
         raise NotImplementedError(f"The specified criterion \"{self.criterion}\" is not implemented.")
     
@@ -75,7 +80,8 @@ if __name__=="__main__":
     for epoch in range(args.epochs):
         
         shuffled_train_metrics = utils.train_one_epoch(model, criterion, optimizer, shuffled_train_loader)
-        train_metrics = utils.evaluate(model, criterion, train_loader)
+        #train_metrics = utils.evaluate(model, criterion, train_loader)
+        train_metrics = shuffled_train_metrics
         val_metrics = utils.evaluate(model, criterion, val_loader)
         test_metrics = utils.evaluate(model, criterion, test_loader)
         

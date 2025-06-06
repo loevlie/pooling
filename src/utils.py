@@ -30,7 +30,7 @@ def evaluate(model, criterion, dataloader):
 
             params = torch.nn.utils.parameters_to_vector(model.parameters())
             logits, attention_weights = model(images, lengths)
-            losses = criterion(logits, labels, params, len(dataloader.dataset))
+            losses = criterion(logits, labels, attention_weights=attention_weights, lengths=lengths, params=params, N=len(dataloader.dataset))
 
             metrics["loss"] += (batch_size/dataset_size)*losses["loss"].item()
             metrics["nll"] += (batch_size/dataset_size)*losses["nll"].item()
@@ -50,19 +50,19 @@ def evaluate(model, criterion, dataloader):
             
     return metrics
 
-def generate_toy_data(N, delta=1.0, deltaS=3, h=0, p_y1=0.5, S=23, seed=42):
+def generate_toy_data(N, H=768, h=1, delta=1.0, S_low=15, S_high=46, deltaS=3, p_y1=0.5, seed=42):
     
     g = torch.Generator()
     g.manual_seed(seed)
     
-    X = torch.randn(S*N, 768, generator=g)
-    lengths = (S,) * N
-    u = torch.cat([torch.randint(0, S-(deltaS-1), size=(1,), generator=g) for length in lengths])
+    lengths = tuple(torch.randint(low=S_low, high=S_high, size=(N,), generator=g).tolist())
+    X = torch.randn(sum(lengths), H, generator=g)
+    u = torch.cat([torch.randint(0, length-(deltaS-1), size=(1,), generator=g) for length in lengths])
     y = torch.bernoulli(p_y1 * torch.ones(size=(N,)), generator=g).to(torch.int)
     
     for i, X_i in enumerate(torch.split(X, lengths)):
         if y[i] == 1:
-            X_i[u[i]:u[i]+deltaS,h] += delta
+            X_i[u[i]:u[i]+deltaS,h-1] += delta
             
     return X, lengths, u, y.view(-1, 1).float()
 
@@ -109,7 +109,7 @@ def train_one_epoch(model, criterion, optimizer, dataloader, lr_scheduler=None):
         optimizer.zero_grad()
         params = torch.nn.utils.parameters_to_vector(model.parameters())
         logits, attention_weights = model(images, lengths)
-        losses = criterion(logits, labels, params, len(dataloader.dataset))
+        losses = criterion(logits, labels, attention_weights=attention_weights, lengths=lengths, params=params, N=len(dataloader.dataset))
         losses["loss"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
