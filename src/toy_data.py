@@ -23,6 +23,8 @@ if __name__=="__main__":
     parser.add_argument("--embedding_level", action='store_true', default=False, help='Whether or not to use the embedding-level approach (default: False)')
     parser.add_argument("--epochs", default=1000, help="Number of epochs (default: 1000)", type=int)
     parser.add_argument("--experiments_directory", default="", help="Directory to save experiments (default: \"\")", type=str)
+    parser.add_argument("--instance_conv", action='store_true', default=False, help='Whether or not to use instance convolutions (default: False)')
+    parser.add_argument("--kernel_size", default=3, help="Kernel size for instance convolutions (default: 3)", type=int)
     parser.add_argument("--lr", default=0.01, help="Learning rate (default: 0.01)", type=float)
     parser.add_argument("--model_name", default="test", help="Model name (default: \"test\")", type=str)
     parser.add_argument("--N_test", default=100, help="Number of testing samples (default: 100)", type=int)
@@ -58,7 +60,7 @@ if __name__=="__main__":
     if args.embedding_level:
         model = models.PoolClf(in_features=768, out_features=1, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
     else:
-        model = models.ClfPool(in_features=768, out_features=1, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
+        model = models.ClfPool(in_features=768, out_features=1, instance_conv=args.instance_conv, kernel_size=args.kernel_size, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
     model.to(device)
         
     if args.criterion == "ERM":
@@ -69,6 +71,8 @@ if __name__=="__main__":
         criterion = losses.L2Loss(alpha=args.alpha, criterion=torch.nn.BCEWithLogitsLoss())
     elif args.criterion == "GuidedL1":
         criterion = losses.GuidedAttentionL1Loss(alpha=args.alpha, beta=args.beta, criterion=torch.nn.BCEWithLogitsLoss())
+    elif args.criterion == "GuidedNormalL1":
+        criterion = losses.GuidedNormalL1Loss(alpha=args.alpha, beta=args.beta, criterion=torch.nn.BCEWithLogitsLoss())
     else:
         raise NotImplementedError(f"The specified criterion \"{self.criterion}\" is not implemented.")
     

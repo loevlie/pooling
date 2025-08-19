@@ -21,7 +21,8 @@ class ClfPool(torch.nn.Module):
         self.instance_conv = instance_conv
         self.kernel_size = kernel_size
         if self.instance_conv:
-            self.conv = layers.InstanceConv1d(in_features=self.out_features, kernel_size=self.kernel_size)
+            #self.conv = layers.InstanceConv1d(in_features=self.out_features, kernel_size=self.kernel_size)
+            self.conv = layers.InstanceConv1d(in_features=self.hidden_dim, kernel_size=self.kernel_size)
                             
         self.pooling = pooling
         if self.pooling == "max":
@@ -30,8 +31,10 @@ class ClfPool(torch.nn.Module):
             self.pool = layers.MeanPooling()
         elif self.pooling == "attention":
             self.pool = layers.AttentionBasedPooling(in_features=self.out_features)
-        elif self.pooling == "multiheadattention":
-            self.pool = layers.MultiHeadAttentionPooling(in_features=self.out_features)
+        elif self.pooling == "self_attention":
+            self.pool = layers.SelfAttentionPooling(in_features=self.out_features)
+        elif self.pooling == "normal":
+            self.pool = layers.NormalPooling(in_features=self.out_features)
         else:
             raise NotImplementedError(f"The specified pooling operation \"{self.pooling}\" is not implemented.")
 
@@ -40,18 +43,21 @@ class ClfPool(torch.nn.Module):
         
         if self.use_pos_embedding:
             x = self.pos_embedding(x, lengths)
-                        
-        x = self.clf(x)
         
         if self.instance_conv:
             x = self.conv(x, lengths)
-                        
+        
+        x = self.clf(x)
+        
+        #if self.instance_conv:
+        #    x = self.conv(x, lengths)
+                                
         x, attention_weights = self.pool(x, lengths)
         
         return x, attention_weights
     
 class PoolClf(torch.nn.Module):
-    def __init__(self, in_features, out_features, pooling="max", num_heads=8, use_pos_embedding=False):
+    def __init__(self, in_features, out_features, instance_conv=False, kernel_size=3, pooling="max", num_heads=8, use_pos_embedding=False):
         super().__init__()
         
         self.in_features = in_features
@@ -62,6 +68,12 @@ class PoolClf(torch.nn.Module):
             self.pos_embedding = layers.PositionalEmbeddingLayer()
             
         self.hidden_dim = self.in_features + 1 if self.use_pos_embedding else self.in_features
+        
+        self.instance_conv = instance_conv
+        self.kernel_size = kernel_size
+        if self.instance_conv:
+            #self.conv = layers.InstanceConv1d(in_features=self.out_features, kernel_size=self.kernel_size)
+            self.conv = layers.InstanceConv1d(in_features=self.hidden_dim, kernel_size=self.kernel_size)
                                     
         self.pooling = pooling
         if self.pooling == "max":
@@ -83,6 +95,9 @@ class PoolClf(torch.nn.Module):
         
         if self.use_pos_embedding:
             x = self.pos_embedding(x, lengths)
+            
+        if self.instance_conv:
+            x = self.conv(x, lengths)
                                                 
         x, attention_weights = self.pool(x, lengths)
         
