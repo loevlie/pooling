@@ -206,3 +206,209 @@ class TransformerBasedPooling(torch.nn.Module):
         x = torch.stack([x_i[0,:] for x_i in torch.split(x, lengths)])
         
         return x, attn_weights
+
+
+class ApproxSm(torch.nn.Module):
+    """Approximate Smooth operator using iterative approach.
+    Based on: https://github.com/Franblueee/SmMIL/blob/main/code/models/modules/Sm.py
+    """
+    def __init__(self, alpha=0.5, num_steps=1):
+        super().__init__()
+        self.alpha = alpha
+        self.num_steps = num_steps
+        
+        if isinstance(self.alpha, float):
+            self.coef = (1.0/(1.0-self.alpha)-1)
+        elif self.alpha == 'trainable':
+            self.coef = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        else:
+            raise ValueError("alpha must be float or 'trainable'")
+    
+    def forward(self, f, A_mat):
+        """
+        Apply approximate smoothing via iterative updates.
+        
+        Args:
+            f: features tensor (batch_size, bag_size, d_dim)
+            A_mat: adjacency matrix tensor (batch_size, bag_size, bag_size)
+        
+        Returns:
+            g: smoothed features (batch_size, bag_size, d_dim)
+        """
+        # torch.sparse bug workaround
+        recover_f = False
+        if f.shape[2] == 1:
+            recover_f = True
+            f = torch.stack([f, f], dim=2).squeeze(-1)  # (batch_size, bag_size, 2)
+        
+        g = f
+        alpha = 1.0 / (1.0 + self.coef)
+        
+        for _ in range(self.num_steps):
+            g = (1.0 - alpha) * f + alpha * torch.bmm(A_mat, g)  # (batch_size, bag_size, d_dim)
+        
+        if recover_f:
+            g = g[:, :, 0].unsqueeze(-1)  # (batch_size, bag_size, 1)
+        
+        return g
+
+
+class ExactSm(torch.nn.Module):
+    """Exact Smooth operator using matrix inversion.
+    Based on: https://github.com/Franblueee/SmMIL/blob/main/code/models/modules/Sm.py
+    """
+    def __init__(self, alpha=0.5):
+        super().__init__()
+        self.alpha = alpha
+        
+        if isinstance(self.alpha, float):
+            self.coef = (1.0/(1.0-self.alpha)-1)
+        elif self.alpha == 'trainable':
+            self.coef = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        else:
+            raise ValueError("alpha must be float or 'trainable'")
+    
+    def forward(self, f, A_mat):
+        """
+        Apply exact smoothing via linear system solution.
+        
+        Args:
+            f: features tensor (batch_size, bag_size, d_dim)
+            A_mat: adjacency matrix tensor (batch_size, bag_size, bag_size)
+        
+        Returns:
+            g: smoothed features (batch_size, bag_size, d_dim)
+        """
+        batch_size = f.shape[0]
+        bag_size = f.shape[1]
+        
+        # Create identity matrix
+        id_mat = torch.eye(bag_size, device=A_mat.device).unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # Construct system matrix: M = (1 + coef) * I - coef * A
+        M = (1 + self.coef) * id_mat - self.coef * A_mat  # (batch_size, bag_size, bag_size)
+        
+        # Solve M * g = f for g
+        g = torch.linalg.solve(M, f)  # (batch_size, bag_size, d_dim)
+        
+        return g
+
+
+class SmMILPooling(torch.nn.Module):
+    """SmMIL: Smooth Multiple Instance Learning pooling.
+    Implements attention-based pooling with optional smoothing via graph convolution.
+    Based on: https://github.com/Franblueee/SmMIL
+    """
+    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, sm_mode='approx', 
+                 sm_steps=1, sm_when='late'):
+        super().__init__()
+        self.in_features = in_features
+        self.temp = temp
+        self.sm_alpha = sm_alpha
+        self.sm_mode = sm_mode
+        self.sm_steps = sm_steps
+        self.sm_when = sm_when  # 'early', 'mid', 'late', or None
+        
+        # Attention mechanism similar to ABMIL
+        self.attention = torch.nn.Sequential(
+            torch.nn.Linear(in_features=in_features, out_features=128),
+            torch.nn.Tanh(),
+            torch.nn.Linear(in_features=128, out_features=1),
+        )
+        
+        # Smooth operator
+        if self.sm_when is not None:
+            if self.sm_mode == 'approx':
+                self.sm = ApproxSm(alpha=sm_alpha, num_steps=sm_steps)
+            elif self.sm_mode == 'exact':
+                self.sm = ExactSm(alpha=sm_alpha)
+            else:
+                raise ValueError(f"Unknown sm_mode: {sm_mode}. Use 'approx' or 'exact'")
+        else:
+            self.sm = None
+    
+    def compute_adjacency_matrix(self, length, device):
+        """Create adjacency matrix for local connectivity (neighboring instances).
+        This creates a normalized adjacency matrix where each instance is connected
+        to its immediate neighbors.
+        """
+        if length == 1:
+            return torch.ones((1, 1), device=device)
+        
+        # Create adjacency matrix with connections to immediate neighbors
+        A = torch.zeros((length, length), device=device)
+        
+        # Add connections to neighbors
+        for i in range(length):
+            # Self-connection
+            A[i, i] = 1.0
+            # Connection to previous neighbor
+            if i > 0:
+                A[i, i-1] = 1.0
+            # Connection to next neighbor
+            if i < length - 1:
+                A[i, i+1] = 1.0
+        
+        # Row-normalize the adjacency matrix
+        row_sums = A.sum(dim=1, keepdim=True)
+        A = A / row_sums
+        
+        return A
+    
+    def forward(self, x, lengths):
+        device = x.device
+        
+        # Early smoothing (on features before attention)
+        if self.sm and self.sm_when == 'early':
+            smoothed_x = []
+            for x_i in torch.split(x, lengths):
+                length = x_i.shape[0]
+                A = self.compute_adjacency_matrix(length, device)
+                # Add batch dimension and apply smoothing
+                x_i_smooth = self.sm(x_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
+                smoothed_x.append(x_i_smooth)
+            x = torch.cat(smoothed_x)
+        
+        # Compute attention logits
+        attn_logits = self.attention(x)
+        
+        # Mid smoothing (on attention logits before softmax)
+        if self.sm and self.sm_when == 'mid':
+            smoothed_logits = []
+            for logits_i in torch.split(attn_logits, lengths):
+                length = logits_i.shape[0]
+                A = self.compute_adjacency_matrix(length, device)
+                # Add batch dimension and apply smoothing
+                logits_i_smooth = self.sm(logits_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
+                smoothed_logits.append(logits_i_smooth)
+            attn_logits = torch.cat(smoothed_logits)
+        
+        # Apply softmax to get attention weights
+        attn_weights = torch.cat([
+            torch.nn.functional.softmax(weights_i/self.temp, dim=0) 
+            for weights_i in torch.split(attn_logits, lengths)
+        ])
+        
+        # Late smoothing (on attention weights after softmax)
+        if self.sm and self.sm_when == 'late':
+            smoothed_weights = []
+            for weights_i in torch.split(attn_weights, lengths):
+                length = weights_i.shape[0]
+                A = self.compute_adjacency_matrix(length, device)
+                # Add batch dimension and apply smoothing
+                weights_i_smooth = self.sm(weights_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
+                # Renormalize after smoothing to ensure valid probability distribution
+                weights_i_smooth = weights_i_smooth / (weights_i_smooth.sum() + 1e-8)
+                smoothed_weights.append(weights_i_smooth)
+            attn_weights = torch.cat(smoothed_weights)
+        
+        # Apply attention weights to features
+        attn_weighted_x = attn_weights * x
+        
+        # Aggregate to get bag representation
+        context_vectors = torch.cat([
+            torch.sum(attn_weighted_x_i, dim=0, keepdim=True) 
+            for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)
+        ])
+        
+        return context_vectors, attn_weights
