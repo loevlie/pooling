@@ -35,6 +35,8 @@ class ClfPool(torch.nn.Module):
             self.pool = layers.SelfAttentionPooling(in_features=self.out_features)
         elif self.pooling == "normal":
             self.pool = layers.NormalPooling(in_features=self.out_features)
+        elif self.pooling == "multilayer_transformer":
+            self.pool = layers.MultiLayerTransformer(in_features=self.out_features)
         elif self.pooling == "smmil":
             self.pool = layers.SmMILPooling(in_features=self.out_features)
         else:
@@ -87,6 +89,9 @@ class PoolClf(torch.nn.Module):
         elif self.pooling == "transformer":
             self.num_heads = num_heads
             self.pool = layers.TransformerBasedPooling(in_features=self.hidden_dim, num_heads=self.num_heads)
+        elif self.pooling == "multilayer_transformer":
+            self.num_heads = num_heads
+            self.pool = layers.MultiLayerTransformer(in_features=self.hidden_dim, num_heads=self.num_heads)
         elif self.pooling == "smmil":
             self.pool = layers.SmMILPooling(in_features=self.hidden_dim)
         else:

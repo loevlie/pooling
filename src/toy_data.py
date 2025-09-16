@@ -18,7 +18,7 @@ if __name__=="__main__":
     parser.add_argument("--data_seed_test", default=2, help="TODO (default: 2)", type=int)
     parser.add_argument("--data_seed_train", default=0, help="TODO (default: 0)", type=int)
     parser.add_argument("--data_seed_val", default=1, help="TODO (default: 1)", type=int)
-    parser.add_argument("--delta", default=1.0, help="TODO (default: 1.0)", type=float)
+    parser.add_argument("--delta", default=3.0, help="TODO (default: 1.0)", type=float)
     parser.add_argument("--deltaS", default=1, help="TODO (default: 1)", type=int)
     parser.add_argument("--embedding_level", action='store_true', default=False, help='Whether or not to use the embedding-level approach (default: False)')
     parser.add_argument("--epochs", default=1000, help="Number of epochs (default: 1000)", type=int)
@@ -73,8 +73,10 @@ if __name__=="__main__":
         criterion = losses.GuidedAttentionL1Loss(alpha=args.alpha, beta=args.beta, criterion=torch.nn.BCEWithLogitsLoss())
     elif args.criterion == "GuidedNormalL1":
         criterion = losses.GuidedNormalL1Loss(alpha=args.alpha, beta=args.beta, criterion=torch.nn.BCEWithLogitsLoss())
+    elif args.criterion == "EntropyRegularization":
+        criterion = losses.EntropyRegularizationLoss(entropy_weight=args.alpha, criterion=torch.nn.BCEWithLogitsLoss())
     else:
-        raise NotImplementedError(f"The specified criterion \"{self.criterion}\" is not implemented.")
+        raise NotImplementedError(f"The specified criterion \"{args.criterion}\" is not implemented.")
     
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=0.9)
     

@@ -299,7 +299,7 @@ class SmMILPooling(torch.nn.Module):
     Implements attention-based pooling with optional smoothing via graph convolution.
     Based on: https://github.com/Franblueee/SmMIL
     """
-    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, sm_mode='approx', 
+    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, sm_mode='approx',
                  sm_steps=1, sm_when='late'):
         super().__init__()
         self.in_features = in_features
@@ -308,14 +308,14 @@ class SmMILPooling(torch.nn.Module):
         self.sm_mode = sm_mode
         self.sm_steps = sm_steps
         self.sm_when = sm_when  # 'early', 'mid', 'late', or None
-        
+
         # Attention mechanism similar to ABMIL
         self.attention = torch.nn.Sequential(
             torch.nn.Linear(in_features=in_features, out_features=128),
             torch.nn.Tanh(),
             torch.nn.Linear(in_features=128, out_features=1),
         )
-        
+
         # Smooth operator
         if self.sm_when is not None:
             if self.sm_mode == 'approx':
@@ -326,7 +326,7 @@ class SmMILPooling(torch.nn.Module):
                 raise ValueError(f"Unknown sm_mode: {sm_mode}. Use 'approx' or 'exact'")
         else:
             self.sm = None
-    
+
     def compute_adjacency_matrix(self, length, device):
         """Create adjacency matrix for local connectivity (neighboring instances).
         This creates a normalized adjacency matrix where each instance is connected
@@ -334,10 +334,10 @@ class SmMILPooling(torch.nn.Module):
         """
         if length == 1:
             return torch.ones((1, 1), device=device)
-        
+
         # Create adjacency matrix with connections to immediate neighbors
         A = torch.zeros((length, length), device=device)
-        
+
         # Add connections to neighbors
         for i in range(length):
             # Self-connection
@@ -348,16 +348,16 @@ class SmMILPooling(torch.nn.Module):
             # Connection to next neighbor
             if i < length - 1:
                 A[i, i+1] = 1.0
-        
+
         # Row-normalize the adjacency matrix
         row_sums = A.sum(dim=1, keepdim=True)
         A = A / row_sums
-        
+
         return A
-    
+
     def forward(self, x, lengths):
         device = x.device
-        
+
         # Early smoothing (on features before attention)
         if self.sm and self.sm_when == 'early':
             smoothed_x = []
@@ -368,10 +368,10 @@ class SmMILPooling(torch.nn.Module):
                 x_i_smooth = self.sm(x_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
                 smoothed_x.append(x_i_smooth)
             x = torch.cat(smoothed_x)
-        
+
         # Compute attention logits
         attn_logits = self.attention(x)
-        
+
         # Mid smoothing (on attention logits before softmax)
         if self.sm and self.sm_when == 'mid':
             smoothed_logits = []
@@ -382,13 +382,13 @@ class SmMILPooling(torch.nn.Module):
                 logits_i_smooth = self.sm(logits_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
                 smoothed_logits.append(logits_i_smooth)
             attn_logits = torch.cat(smoothed_logits)
-        
+
         # Apply softmax to get attention weights
         attn_weights = torch.cat([
-            torch.nn.functional.softmax(weights_i/self.temp, dim=0) 
+            torch.nn.functional.softmax(weights_i/self.temp, dim=0)
             for weights_i in torch.split(attn_logits, lengths)
         ])
-        
+
         # Late smoothing (on attention weights after softmax)
         if self.sm and self.sm_when == 'late':
             smoothed_weights = []
@@ -401,14 +401,242 @@ class SmMILPooling(torch.nn.Module):
                 weights_i_smooth = weights_i_smooth / (weights_i_smooth.sum() + 1e-8)
                 smoothed_weights.append(weights_i_smooth)
             attn_weights = torch.cat(smoothed_weights)
-        
+
         # Apply attention weights to features
         attn_weighted_x = attn_weights * x
-        
+
         # Aggregate to get bag representation
         context_vectors = torch.cat([
-            torch.sum(attn_weighted_x_i, dim=0, keepdim=True) 
+            torch.sum(attn_weighted_x_i, dim=0, keepdim=True)
             for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)
         ])
-        
+
         return context_vectors, attn_weights
+
+
+class MaskedTransformerLayer(torch.nn.Module):
+    def __init__(self, in_features, num_heads=8, local_window=3):
+        super().__init__()
+        self.in_features = in_features
+        self.num_heads = num_heads
+        self.local_window = local_window
+        self.norm = torch.nn.LayerNorm(normalized_shape=self.in_features)
+        self.attn = torch.nn.MultiheadAttention(embed_dim=self.in_features, num_heads=self.num_heads)
+
+    def create_local_mask(self, seq_len, device):
+        """Create mask that forces local connections within a window."""
+        mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
+
+        for i in range(seq_len):
+            start = max(0, i - self.local_window // 2)
+            end = min(seq_len, i + self.local_window // 2 + 1)
+            mask[i, start:end] = 0.0
+
+        return mask
+
+    def forward(self, x, lengths):
+        out_list = []
+        attn_weights_list = []
+
+        for x_i in torch.split(self.norm(x), lengths):
+            seq_len = x_i.shape[0]
+            mask = self.create_local_mask(seq_len, x_i.device)
+
+            out_i, attn_weights_i = self.attn(x_i, x_i, x_i, attn_mask=mask)
+            out_list.append(out_i)
+            attn_weights_list.append(attn_weights_i)
+
+        x = x + torch.cat(out_list)
+        return x, attn_weights_list
+
+
+def create_sinusoidal_positional_encoding(seq_len, d_model, device):
+    """Create sinusoidal positional encoding"""
+    position = torch.arange(seq_len, device=device).unsqueeze(1).float()
+    div_term = torch.exp(torch.arange(0, d_model, 2, device=device).float() *
+                         -(torch.log(torch.tensor(10000.0)) / d_model))
+
+    pos_encoding = torch.zeros(seq_len, d_model, device=device)
+    pos_encoding[:, 0::2] = torch.sin(position * div_term)
+    pos_encoding[:, 1::2] = torch.cos(position * div_term)
+
+    return pos_encoding
+
+
+class MultiLayerTransformer(torch.nn.Module):
+    def __init__(self, in_features, num_layers=2, num_heads=8, local_window=5, use_cls_token=True):
+        super().__init__()
+        self.in_features = in_features
+        self.num_layers = num_layers
+        # Ensure num_heads is compatible with in_features
+        self.num_heads = min(num_heads, in_features) if in_features % num_heads != 0 else num_heads
+        if in_features % self.num_heads != 0:
+            self.num_heads = 1  # Fall back to single head if not divisible
+        self.local_window = local_window
+        self.use_cls_token = use_cls_token
+
+        if self.use_cls_token:
+            self.cls_token = torch.nn.Parameter(torch.randn(size=(1, self.in_features,)))
+
+        # Create transformer layers - first one is masked, rest are standard
+        self.layers = torch.nn.ModuleList()
+        self.layers.append(MaskedTransformerLayer(
+            in_features=in_features,
+            num_heads=self.num_heads,
+            local_window=local_window
+        ))
+        for _ in range(num_layers - 1):
+            self.layers.append(TransformerLayer(
+                in_features=in_features,
+                num_heads=self.num_heads
+            ))
+
+        # Layer norms for stability
+        self.layer_norms = torch.nn.ModuleList([
+            torch.nn.LayerNorm(normalized_shape=self.in_features)
+            for _ in range(num_layers)
+        ])
+
+        # Final attention and norm for CLS token
+        if self.use_cls_token:
+            self.final_attn = torch.nn.MultiheadAttention(
+                embed_dim=self.in_features,
+                num_heads=self.num_heads
+            )
+            self.final_norm = torch.nn.LayerNorm(normalized_shape=self.in_features)
+
+        # Store attention maps for analysis
+        self.intermediate_attentions = []
+        self.cls_attention = None
+
+    def forward(self, x, lengths):
+        device = x.device
+        self.intermediate_attentions = []
+
+        # Add sinusoidal positional encoding to input
+        x_with_pos = []
+        for x_i in torch.split(x, lengths):
+            seq_len = x_i.shape[0]
+            pos_encoding = create_sinusoidal_positional_encoding(seq_len, self.in_features, device)
+            x_with_pos.append(x_i + pos_encoding)
+        x = torch.cat(x_with_pos)
+
+        # Process through transformer layers
+        for i, layer in enumerate(self.layers):
+            # Apply layer norm before attention
+            x_norm = torch.cat([self.layer_norms[i](x_i) for x_i in torch.split(x, lengths)])
+            x_out, layer_attn_weights = layer(x_norm, lengths)
+            x = x_out
+
+            # Store attention weights for analysis
+            avg_attn_weights = []
+            for attn_i in layer_attn_weights:
+                if attn_i.dim() == 3:  # Multi-head attention
+                    avg_attn_i = attn_i.mean(dim=0)
+                else:
+                    avg_attn_i = attn_i
+                avg_attn_weights.append(avg_attn_i)
+            self.intermediate_attentions.append(avg_attn_weights)
+
+        if self.use_cls_token:
+            # Add CLS token
+            x = torch.cat([torch.cat((self.cls_token, x_i)) for x_i in torch.split(x, lengths)])
+            lengths_with_cls = tuple(length + 1 for length in lengths)
+
+            # Add positional encoding with CLS
+            x_with_cls_pos = []
+            for x_i in torch.split(x, lengths_with_cls):
+                seq_len = x_i.shape[0]
+                pos_encoding = create_sinusoidal_positional_encoding(seq_len, self.in_features, device)
+                x_with_cls_pos.append(x_i + pos_encoding)
+            x = torch.cat(x_with_cls_pos)
+
+            # Final attention layer
+            out, attn_weights_list = zip(*[
+                self.final_attn(self.final_norm(x_i), self.final_norm(x_i), self.final_norm(x_i))
+                for x_i in torch.split(x, lengths_with_cls)
+            ])
+            x = x + torch.cat(out)
+
+            # Store CLS attention
+            self.cls_attention = []
+            for attn_i in attn_weights_list:
+                if attn_i.dim() == 3:  # Multi-head
+                    cls_attn = attn_i.mean(dim=0)[0, 1:]  # Average heads, CLS row, exclude self
+                else:
+                    cls_attn = attn_i[0, 1:]
+                self.cls_attention.append(cls_attn)
+
+            # Extract final attention weights for output
+            final_attn_weights = torch.cat([
+                attn_weights_i.mean(dim=0)[0, 1:] if attn_weights_i.dim() == 3 else attn_weights_i[0, 1:]
+                for attn_weights_i in attn_weights_list
+            ])
+
+            # Get CLS token representation
+            x = torch.stack([x_i[0, :] for x_i in torch.split(x, lengths_with_cls)])
+        else:
+            # Mean pooling if no CLS token
+            x = torch.cat([torch.mean(x_i, dim=0, keepdim=True) for x_i in torch.split(x, lengths)])
+            final_attn_weights = torch.cat([torch.ones(length, device=device) / length for length in lengths])
+
+        return x, final_attn_weights.unsqueeze(1) if final_attn_weights.dim() == 1 else final_attn_weights
+
+    def compute_attention_regularization(self, lengths, labels=None):
+        """Light attention regularization to prevent extreme behaviors"""
+        if self.cls_attention is None or labels is None:
+            return torch.tensor(0.0, device=self.cls_token.device if hasattr(self, 'cls_token') else 'cpu')
+
+        reg_loss = 0.0
+        for i, cls_attn in enumerate(self.cls_attention):
+            is_positive = labels[i].item() > 0.5
+            seq_len = len(cls_attn)
+            entropy = -(cls_attn * torch.log(cls_attn + 1e-8)).sum()
+            max_entropy = torch.log(torch.tensor(float(seq_len)))
+            normalized_entropy = entropy / max_entropy
+
+            if is_positive:
+                # For positive: light penalty if too uniform (entropy > 0.9)
+                if normalized_entropy > 0.9:
+                    reg_loss += (normalized_entropy - 0.9) ** 2 * 0.01
+            else:
+                # For negative: light penalty if too focused (entropy < 0.4)
+                if normalized_entropy < 0.4:
+                    reg_loss += (0.4 - normalized_entropy) ** 2 * 0.01
+
+        return reg_loss
+
+
+def entropy_regularization_loss(attn_weights, labels, lengths, entropy_weight=0.1):
+    """
+    Entropy regularization loss that encourages:
+    - Peaky attention weights for positive labels (low entropy)
+    - Flat attention weights for negative labels (high entropy)
+
+    Args:
+        attn_weights: attention weights tensor
+        labels: binary labels (0 or 1)
+        lengths: sequence lengths for each sample
+        entropy_weight: weight for entropy regularization term
+
+    Returns:
+        entropy_loss: regularization loss
+    """
+    entropy_losses = []
+
+    for i, (weights_i, label) in enumerate(zip(torch.split(attn_weights, lengths), labels)):
+        # Compute entropy: -sum(p * log(p))
+        eps = 1e-8
+        entropy = -torch.sum(weights_i * torch.log(weights_i + eps))
+
+        if label > 0.5:  # Positive label - encourage low entropy (peaky)
+            entropy_loss = entropy
+        else:  # Negative label - encourage high entropy (flat)
+            # Use negative entropy to encourage high entropy
+            max_entropy = torch.log(torch.tensor(len(weights_i), dtype=torch.float32, device=weights_i.device))
+            entropy_loss = max_entropy - entropy
+
+        entropy_losses.append(entropy_loss)
+
+    total_entropy_loss = torch.stack(entropy_losses).mean()
+    return entropy_weight * total_entropy_loss

@@ -119,4 +119,41 @@ class GuidedNormalL1Loss(torch.nn.Module):
         stds_penalty = (self.beta/2) * ((stds-ideal_stds)**2).mean()
         
         return {'loss': nll + penalty + stds_penalty, 'nll': nll}
+
+
+class EntropyRegularizationLoss(torch.nn.Module):
+    def __init__(self, entropy_weight=0.1, criterion=torch.nn.BCEWithLogitsLoss()):
+        super().__init__()
+        self.entropy_weight = entropy_weight
+        self.criterion = criterion
+
+    def forward(self, logits, labels, **kwargs):
+        lengths = kwargs["lengths"]
+        attn_weights = kwargs["attn_weights"]
+        model = kwargs.get("model", None)
+
+        nll = self.criterion(logits, labels)
+
+        # Use model's built-in regularization if available (MultiLayerTransformer)
+        if model and hasattr(model.pool, 'compute_attention_regularization'):
+            entropy_penalty = self.entropy_weight * model.pool.compute_attention_regularization(lengths, labels)
+        else:
+            # Fallback to original entropy regularization
+            attn_weights_flat = attn_weights.view(-1)
+            entropy_losses = []
+            for weights_i, label in zip(torch.split(attn_weights_flat, lengths), labels):
+                eps = 1e-8
+                entropy = -torch.sum(weights_i * torch.log(weights_i + eps))
+
+                if label > 0.5:  # Positive label - encourage low entropy (peaky)
+                    entropy_loss = entropy
+                else:  # Negative label - encourage high entropy (flat)
+                    max_entropy = torch.log(torch.tensor(len(weights_i), dtype=torch.float32, device=weights_i.device))
+                    entropy_loss = max_entropy - entropy
+
+                entropy_losses.append(entropy_loss)
+
+            entropy_penalty = self.entropy_weight * torch.stack(entropy_losses).mean()
+
+        return {'loss': nll + entropy_penalty, 'nll': nll}
     
