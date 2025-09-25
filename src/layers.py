@@ -14,6 +14,44 @@ class AttentionBasedPooling(torch.nn.Module):
         )
 
     def forward(self, x, lengths):
+        """
+        Compute ABMIL-style attention pooling over a concatenated list of bags.
+
+        Args:
+            x (torch.Tensor): Tensor of shape (N, d) containing all instance
+                embeddings from a batch of bags concatenated end-to-end, where
+                N = sum_i S_i and d is the embedding dimension. The instances
+                belonging to each bag must be contiguous in `x` and in the same
+                order as `lengths`.
+            lengths (Sequence[int] or 1D torch.Tensor): Per-bag instance counts
+                (S_1, S_2, ..., S_B). Must satisfy sum(lengths) == N. Each S_i
+                must be >= 1. No padding is expected; empty bags are not supported.
+
+        Returns:
+            context_vectors (torch.Tensor): Tensor of shape (B, d). For each bag,
+                this is the weighted sum of its instances, where weights are an
+                attention distribution over the S_i instances that sums to 1.
+            attn_weights (torch.Tensor): Tensor of shape (N, 1). The attention
+                weights for every instance across all bags, stacked in the same
+                order as `x`. For each bag i, the S_i weights are obtained by a
+                softmax over that bag’s instances (temperature-scaled by `self.temp`)
+                and thus sum to 1 within the bag.
+
+        Notes:
+            • Attention logits are produced by a small MLP: Linear(d→128) → Tanh →
+              Linear(128→1). The logits are divided by `self.temp` before the
+              per-bag softmax. Lower `temp` (< 1) makes weights peakier; higher
+              `temp` (> 1) smooths them.
+            • Complexity is O(N·d) for the weighted sum plus O(N) for attention.
+
+        Example:
+            >>> lengths = [4, 3, 5]               # B = 3, N = 12
+            >>> x = torch.randn(sum(lengths), 256)
+            >>> pool = AttentionBasedPooling(in_features=256, temp=0.7)
+            >>> ctx, w = pool(x, lengths)
+            >>> ctx.shape, w.shape
+            (torch.Size([3, 256]), torch.Size([12, 1]))
+        """
         
         attn_logits = self.mlp(x)
         attn_weights = torch.cat([torch.nn.functional.softmax(weights_i/self.temp, dim=0) for weights_i in torch.split(attn_logits, lengths)])
@@ -208,90 +246,138 @@ class TransformerBasedPooling(torch.nn.Module):
         return x, attn_weights
 
 
-class ApproxSm(torch.nn.Module):
-    """Approximate Smooth operator using iterative approach.
-    Based on: https://github.com/Franblueee/SmMIL/blob/main/code/models/modules/Sm.py
+def _neighbor_avg_chain_k(g: torch.Tensor, radius: int = 1, self_loop: bool = False) -> torch.Tensor:
     """
-    def __init__(self, alpha=0.5, num_steps=1):
+    One neighbor-average on a 1-D chain with k neighbors per side, using slicing only.
+    g: (S,) or (S,d)
+    """
+    S = g.size(0)
+    if S <= 1 or radius <= 0:
+        return g.clone()
+
+    # work in (S,d)
+    squeeze = False
+    if g.dim() == 1:
+        g = g.unsqueeze(1)
+        squeeze = True
+
+    device, dtype = g.device, g.dtype
+    agg = torch.zeros_like(g)                 # (S,d)
+    deg = torch.zeros((S, 1), device=device, dtype=dtype)  # (S,1)
+
+    if self_loop:
+        agg += g
+        deg += 1.0
+
+    # left/right neighbors via slicing (no wrap)
+    for k in range(1, radius + 1):
+        # left neighbor at distance k: contributes to positions [k:S]
+        agg[k:]  += g[:-k]
+        deg[k:]  += 1.0
+
+        # right neighbor at distance k: contributes to positions [0:S-k]
+        agg[:-k] += g[k:]
+        deg[:-k] += 1.0
+
+    avg = agg / deg.clamp_min(1e-12)
+    return avg.squeeze(1) if squeeze else avg
+
+
+class ApproxSm(torch.nn.Module):
+    """
+    Jacobi-like smoothing for a single bag:
+        g_{t+1} = (1 - alpha) * f + alpha * avg_k(g_t)
+    """
+    def __init__(self, alpha=0.5, num_steps=10):
         super().__init__()
-        self.alpha = alpha
-        self.num_steps = num_steps
-        
-        if isinstance(self.alpha, float):
-            self.coef = (1.0/(1.0-self.alpha)-1)
-        elif self.alpha == 'trainable':
-            self.coef = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.num_steps = int(num_steps)
+        if alpha == 'trainable':
+            self._raw = torch.nn.Parameter(torch.tensor(0.0))      # sigmoid -> (0,1)
+            self.register_buffer('_alpha_fixed', None)
         else:
-            raise ValueError("alpha must be float or 'trainable'")
-    
-    def forward(self, f, A_mat):
+            a = float(alpha); assert 0.0 <= a < 1.0
+            self._raw = None
+            self.register_buffer('_alpha_fixed', torch.tensor(a))
+
+    def _alpha(self):
+        return torch.sigmoid(self._raw) if self._raw is not None else self._alpha_fixed
+
+    def forward(self, f: torch.Tensor, neighbors: int = 1, self_loop: bool = False) -> torch.Tensor:
         """
-        Apply approximate smoothing via iterative updates.
-        
-        Args:
-            f: features tensor (batch_size, bag_size, d_dim)
-            A_mat: adjacency matrix tensor (batch_size, bag_size, bag_size)
-        
-        Returns:
-            g: smoothed features (batch_size, bag_size, d_dim)
+        f: (S,) or (S,d) logits/features for one bag
+        neighbors: k (radius) of neighbors on each side
+        self_loop: include the element itself in the average
         """
-        # torch.sparse bug workaround
-        recover_f = False
-        if f.shape[2] == 1:
-            recover_f = True
-            f = torch.stack([f, f], dim=2).squeeze(-1)  # (batch_size, bag_size, 2)
-        
-        g = f
-        alpha = 1.0 / (1.0 + self.coef)
-        
+        alpha = self._alpha()
+        g = f.clone()
         for _ in range(self.num_steps):
-            g = (1.0 - alpha) * f + alpha * torch.bmm(A_mat, g)  # (batch_size, bag_size, d_dim)
-        
-        if recover_f:
-            g = g[:, :, 0].unsqueeze(-1)  # (batch_size, bag_size, 1)
-        
+            avg = _neighbor_avg_chain_k(g, radius=neighbors, self_loop=self_loop)
+            g = (1.0 - alpha) * f + alpha * avg
         return g
 
 
+def _build_chain_A(length: int, radius: int = 1, self_loop: bool = False, *, device=None, dtype=None):
+    """
+    Dense row-stochastic k-neighbor chain adjacency A (length x length).
+    No wrap-around; ends have fewer neighbors. Optional self loop.
+    """
+    A = torch.zeros((length, length), device=device, dtype=dtype)
+    if self_loop:
+        A.fill_diagonal_(1.0)
+    if length >= 2:
+        for k in range(1, radius + 1):
+            A[k:, :-k] += torch.eye(length - k, device=device, dtype=dtype)   # left k
+            A[:-k, k:] += torch.eye(length - k, device=device, dtype=dtype)   # right k
+    rowsum = A.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    A = A / rowsum
+    return A
+
 class ExactSm(torch.nn.Module):
-    """Exact Smooth operator using matrix inversion.
-    Based on: https://github.com/Franblueee/SmMIL/blob/main/code/models/modules/Sm.py
+    """
+    Exact solution consistent with the approx update:
+        g = (1 - alpha) f + alpha A g  ==>  (I - alpha A) g = (1 - alpha) f
+    Solved per-bag with a dense (S x S) linear solve. Works for (S,) or (S,d).
     """
     def __init__(self, alpha=0.5):
         super().__init__()
-        self.alpha = alpha
-        
-        if isinstance(self.alpha, float):
-            self.coef = (1.0/(1.0-self.alpha)-1)
-        elif self.alpha == 'trainable':
-            self.coef = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        if alpha == 'trainable':
+            self._raw = torch.nn.Parameter(torch.tensor(0.0))  # sigmoid -> (0,1)
+            self.register_buffer('_alpha_fixed', None)
         else:
-            raise ValueError("alpha must be float or 'trainable'")
-    
-    def forward(self, f, A_mat):
+            a = float(alpha)
+            if not (0.0 <= a < 1.0):
+                raise ValueError("alpha must be in [0,1).")
+            self._raw = None
+            self.register_buffer('_alpha_fixed', torch.tensor(a))
+
+    def _alpha(self):
+        return torch.sigmoid(self._raw) if self._raw is not None else self._alpha_fixed
+
+    def forward(self, f: torch.Tensor, neighbors: int = 1, self_loop: bool = False) -> torch.Tensor:
         """
-        Apply exact smoothing via linear system solution.
-        
-        Args:
-            f: features tensor (batch_size, bag_size, d_dim)
-            A_mat: adjacency matrix tensor (batch_size, bag_size, bag_size)
-        
-        Returns:
-            g: smoothed features (batch_size, bag_size, d_dim)
+        f: (S,) or (S,d) logits/features for one bag
+        neighbors: k-neighbor radius
+        self_loop: include self in A
         """
-        batch_size = f.shape[0]
-        bag_size = f.shape[1]
-        
-        # Create identity matrix
-        id_mat = torch.eye(bag_size, device=A_mat.device).unsqueeze(0).repeat(batch_size, 1, 1)
-        
-        # Construct system matrix: M = (1 + coef) * I - coef * A
-        M = (1 + self.coef) * id_mat - self.coef * A_mat  # (batch_size, bag_size, bag_size)
-        
-        # Solve M * g = f for g
-        g = torch.linalg.solve(M, f)  # (batch_size, bag_size, d_dim)
-        
-        return g
+        a = self._alpha()
+        S = f.size(0)
+        if S <= 1:
+            return f.clone()
+
+        # work in (S,d)
+        squeeze = False
+        if f.dim() == 1:
+            f2 = f.unsqueeze(1)
+            squeeze = True
+        else:
+            f2 = f
+
+        A = _build_chain_A(S, radius=neighbors, self_loop=self_loop, device=f.device, dtype=f.dtype)  
+        M = torch.eye(S, device=f.device, dtype=f.dtype) - a * A                                      
+        rhs = (1.0 - a) * f2                                                                          
+        g2 = torch.linalg.solve(M, rhs)                                                               
+        return g2.squeeze(1) if squeeze else g2
+
 
 
 class SmMILPooling(torch.nn.Module):
@@ -299,116 +385,65 @@ class SmMILPooling(torch.nn.Module):
     Implements attention-based pooling with optional smoothing via graph convolution.
     Based on: https://github.com/Franblueee/SmMIL
     """
-    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, sm_mode='approx', 
-                 sm_steps=1, sm_when='late'):
+    def __init__(self, in_features, temp=1.0, sm_alpha="trainable", 
+                 sm_steps=10):
         super().__init__()
         self.in_features = in_features
         self.temp = temp
         self.sm_alpha = sm_alpha
-        self.sm_mode = sm_mode
+        # self.sm_mode = sm_mode
         self.sm_steps = sm_steps
-        self.sm_when = sm_when  # 'early', 'mid', 'late', or None
-        
-        # Attention mechanism similar to ABMIL
-        self.attention = torch.nn.Sequential(
+        self.mlp = torch.nn.Sequential(
             torch.nn.Linear(in_features=in_features, out_features=128),
             torch.nn.Tanh(),
             torch.nn.Linear(in_features=128, out_features=1),
         )
+        # self.sm_layer_approx = ApproxSm(alpha=self.sm_alpha, num_steps=self.sm_steps)
+        self.sm_layer_approx = ExactSm(alpha=self.sm_alpha)
         
-        # Smooth operator
-        if self.sm_when is not None:
-            if self.sm_mode == 'approx':
-                self.sm = ApproxSm(alpha=sm_alpha, num_steps=sm_steps)
-            elif self.sm_mode == 'exact':
-                self.sm = ExactSm(alpha=sm_alpha)
-            else:
-                raise ValueError(f"Unknown sm_mode: {sm_mode}. Use 'approx' or 'exact'")
-        else:
-            self.sm = None
-    
-    def compute_adjacency_matrix(self, length, device):
-        """Create adjacency matrix for local connectivity (neighboring instances).
-        This creates a normalized adjacency matrix where each instance is connected
-        to its immediate neighbors.
+    def forward(self, x, lengths, neighbors=1):
         """
-        if length == 1:
-            return torch.ones((1, 1), device=device)
+        Compute SmMIL pooling over a concatenated list of bags.
         
-        # Create adjacency matrix with connections to immediate neighbors
-        A = torch.zeros((length, length), device=device)
+        Args:
+            x: Tensor of shape (N, d) with all instance embeddings from a batch of bags concatenated end-to-end.
+               N = sum_i S_i, where S_i is the number of instances in bag i, and d is the embedding dimension.
+               Instances belonging to each bag must be contiguous in `x` and in the same order as `lengths`.
+            lengths: Sequence[int] or 1D tensor with per-bag instance counts (S_1, S_2, ..., S_B).
+                     Must satisfy sum(lengths) == N. Each S_i must be >= 1. No padding is expected; empty bags are not supported.
+            A_mat: Optional adjacency matrix tensor of shape (B, max_S, max_S) for smoothing.
+                   If provided, enables smoothing; if None, no smoothing is applied.
         
-        # Add connections to neighbors
-        for i in range(length):
-            # Self-connection
-            A[i, i] = 1.0
-            # Connection to previous neighbor
-            if i > 0:
-                A[i, i-1] = 1.0
-            # Connection to next neighbor
-            if i < length - 1:
-                A[i, i+1] = 1.0
+        Returns:
+            context_vectors: Tensor of shape (B, d) with weighted sum of instances per bag.
+                             Weights are attention distributions over instances that sum to 1 within each bag.
+            attn_weights: Tensor of shape (N, 1) with attention weights for every instance across all bags,
+                          stacked in the same order as `x`. For each bag i, the S_i weights are obtained
+                          by a softmax over that bag’s instances (temperature-scaled by `self.temp`) and thus sum to 1 within the bag.
+        """
+        # Starting with only the late implementation for now
         
-        # Row-normalize the adjacency matrix
-        row_sums = A.sum(dim=1, keepdim=True)
-        A = A / row_sums
-        
-        return A
-    
-    def forward(self, x, lengths):
-        device = x.device
-        
-        # Early smoothing (on features before attention)
-        if self.sm and self.sm_when == 'early':
-            smoothed_x = []
-            for x_i in torch.split(x, lengths):
-                length = x_i.shape[0]
-                A = self.compute_adjacency_matrix(length, device)
-                # Add batch dimension and apply smoothing
-                x_i_smooth = self.sm(x_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
-                smoothed_x.append(x_i_smooth)
-            x = torch.cat(smoothed_x)
-        
-        # Compute attention logits
-        attn_logits = self.attention(x)
-        
-        # Mid smoothing (on attention logits before softmax)
-        if self.sm and self.sm_when == 'mid':
-            smoothed_logits = []
-            for logits_i in torch.split(attn_logits, lengths):
-                length = logits_i.shape[0]
-                A = self.compute_adjacency_matrix(length, device)
-                # Add batch dimension and apply smoothing
-                logits_i_smooth = self.sm(logits_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
-                smoothed_logits.append(logits_i_smooth)
-            attn_logits = torch.cat(smoothed_logits)
-        
-        # Apply softmax to get attention weights
-        attn_weights = torch.cat([
-            torch.nn.functional.softmax(weights_i/self.temp, dim=0) 
-            for weights_i in torch.split(attn_logits, lengths)
-        ])
-        
-        # Late smoothing (on attention weights after softmax)
-        if self.sm and self.sm_when == 'late':
-            smoothed_weights = []
-            for weights_i in torch.split(attn_weights, lengths):
-                length = weights_i.shape[0]
-                A = self.compute_adjacency_matrix(length, device)
-                # Add batch dimension and apply smoothing
-                weights_i_smooth = self.sm(weights_i.unsqueeze(0), A.unsqueeze(0)).squeeze(0)
-                # Renormalize after smoothing to ensure valid probability distribution
-                weights_i_smooth = weights_i_smooth / (weights_i_smooth.sum() + 1e-8)
-                smoothed_weights.append(weights_i_smooth)
-            attn_weights = torch.cat(smoothed_weights)
-        
-        # Apply attention weights to features
+        attn_logits = self.mlp(x)
+        # The code below checks that the approx solution matches the exact solution
+        # with torch.no_grad():
+        #     logits = self.mlp(x)  # (N,1)
+        #     approx_chunks = []
+        #     exact_chunks  = []
+
+        #     offset = 0
+        #     for b, L in enumerate(lengths):
+        #         li = logits[offset:offset+L, 0]                  # (L,)
+        #         g_approx = self.sm_layer_approx(li, neighbors=neighbors, self_loop=False)  # (L,)
+        #         g_exact  = self.sm_layer_exact(li, neighbors=neighbors, self_loop=False)  # (L,)
+        #         approx_chunks.append(g_approx.unsqueeze(1))
+        #         exact_chunks .append(g_exact.unsqueeze(1))
+                # diff = (g_approx - g_exact)
+                # print(f"[bag {b}] L={L}  ||approx-exact||_2={diff.norm().item():.6f}  "
+                #     f"max|diff|={diff.abs().max().item():.6f}")
+                # offset += L
+        attn_logits_smoothed = torch.cat([self.sm_layer_approx(logits_i) for logits_i in torch.split(attn_logits, lengths)])
+        attn_weights = torch.cat([torch.nn.functional.softmax(smlogits_i/self.temp, dim=0) for smlogits_i in torch.split(attn_logits_smoothed, lengths)])
         attn_weighted_x = attn_weights * x
-        
-        # Aggregate to get bag representation
-        context_vectors = torch.cat([
-            torch.sum(attn_weighted_x_i, dim=0, keepdim=True) 
-            for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)
-        ])
-        
+        context_vectors = torch.cat([torch.sum(attn_weighted_x_i, dim=0, keepdim=True) for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)])
+
         return context_vectors, attn_weights
