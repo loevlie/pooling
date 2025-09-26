@@ -389,7 +389,7 @@ class SmMILPooling(torch.nn.Module):
                  sm_steps=10):
         super().__init__()
         self.in_features = in_features
-        self.temp = temp
+        # self.temp = temp
         self.sm_alpha = sm_alpha
         # self.sm_mode = sm_mode
         self.sm_steps = sm_steps
@@ -411,8 +411,6 @@ class SmMILPooling(torch.nn.Module):
                Instances belonging to each bag must be contiguous in `x` and in the same order as `lengths`.
             lengths: Sequence[int] or 1D tensor with per-bag instance counts (S_1, S_2, ..., S_B).
                      Must satisfy sum(lengths) == N. Each S_i must be >= 1. No padding is expected; empty bags are not supported.
-            A_mat: Optional adjacency matrix tensor of shape (B, max_S, max_S) for smoothing.
-                   If provided, enables smoothing; if None, no smoothing is applied.
         
         Returns:
             context_vectors: Tensor of shape (B, d) with weighted sum of instances per bag.
