@@ -399,7 +399,7 @@ class SmMILPooling(torch.nn.Module):
             torch.nn.Linear(in_features=128, out_features=1),
         )
         # self.sm_layer_approx = ApproxSm(alpha=self.sm_alpha, num_steps=self.sm_steps)
-        self.sm_layer_approx = ExactSm(alpha=self.sm_alpha)
+        self.sm_layer_exact = ExactSm(alpha=self.sm_alpha)
         
     def forward(self, x, lengths, neighbors=1):
         """
@@ -439,7 +439,7 @@ class SmMILPooling(torch.nn.Module):
                 # print(f"[bag {b}] L={L}  ||approx-exact||_2={diff.norm().item():.6f}  "
                 #     f"max|diff|={diff.abs().max().item():.6f}")
                 # offset += L
-        attn_logits_smoothed = torch.cat([self.sm_layer_approx(logits_i) for logits_i in torch.split(attn_logits, lengths)])
+        attn_logits_smoothed = torch.cat([self.sm_layer_exact(logits_i) for logits_i in torch.split(attn_logits, lengths)])
         attn_weights = torch.cat([torch.nn.functional.softmax(smlogits_i/self.temp, dim=0) for smlogits_i in torch.split(attn_logits_smoothed, lengths)])
         attn_weighted_x = attn_weights * x
         context_vectors = torch.cat([torch.sum(attn_weighted_x_i, dim=0, keepdim=True) for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)])
