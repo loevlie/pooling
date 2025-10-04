@@ -251,20 +251,20 @@ class ApproxSm(torch.nn.Module):
     Iterative smoothing via fixed-point iteration: g = (1-α)f + α*A*g
     where A is a row-stochastic adjacency matrix for a 1D chain.
     """
-    def __init__(self, alpha="trainable", num_steps=10):
+    def __init__(self, alpha=0.5, num_steps=10, learnable_alpha=True):
         super().__init__()
+
         self.num_steps = int(num_steps)
+        self.learnable_alpha = bool(learnable_alpha)
         
-        if alpha == 'trainable':
-            self._raw = torch.nn.Parameter(torch.log(torch.tensor(alpha / (1 - alpha), dtype=torch.float32)))
-            self.register_buffer('_alpha_fixed', None)
+        if self.learnable_alpha:
+            self.raw_alpha = torch.nn.Parameter(torch.log(torch.tensor(alpha / (1 - alpha), dtype=torch.float32)))
         else:
-            assert 0.0 <= float(alpha) < 1.0, "alpha must be in [0, 1)"
-            self._raw = None
-            self.register_buffer('_alpha_fixed', torch.tensor(float(alpha)))
+            self.register_buffer("raw_alpha", torch.log(torch.tensor(alpha / (1 - alpha), dtype=torch.float32)))
+
 
     def _alpha(self):
-        return torch.sigmoid(self._raw) if self._raw is not None else self._alpha_fixed
+        return torch.sigmoid(self.raw_alpha)
 
     def forward(self, f: torch.Tensor, neighbors: int = 1, self_loop: bool = False) -> torch.Tensor:
         """
@@ -276,6 +276,7 @@ class ApproxSm(torch.nn.Module):
             g: (S,) or (S, d) - smoothed signal
         """
         alpha = self._alpha()
+        # print(f"Alpha: {alpha.item():.4f}")
         S = f.size(0)
         
         if S <= 1 or neighbors <= 0:
@@ -385,7 +386,7 @@ class SmMILPooling(torch.nn.Module):
     Implements attention-based pooling with optional smoothing via graph convolution.
     Based on: https://github.com/Franblueee/SmMIL
     """
-    def __init__(self, in_features, temp=1.0, sm_alpha="trainable", 
+    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, 
                  sm_steps=10, sm_where='early'):
         super().__init__()
         self.in_features = in_features
@@ -409,7 +410,7 @@ class SmMILPooling(torch.nn.Module):
             fc2,
         )
         
-        self.sm_layer_approx = ApproxSm(alpha=self.sm_alpha, num_steps=self.sm_steps)
+        self.sm_layer_approx = ApproxSm(alpha=self.sm_alpha, num_steps=self.sm_steps,learnable_alpha=True)
         
     def forward(self, x, lengths, neighbors=1):
         """
@@ -425,8 +426,8 @@ class SmMILPooling(torch.nn.Module):
         """
         
         # early mode: Smooth the input embeddings x before the MLP
-        alpha = torch.sigmoid(self.raw_alpha)
         if self.sm_where == 'early':
+            # print("USING EARLY SMOOTHING")
             x_smoothed = torch.cat([
                 self.sm_layer_approx(x_i, neighbors=neighbors, self_loop=False) 
                 for x_i in torch.split(x, lengths)
