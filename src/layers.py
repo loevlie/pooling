@@ -251,12 +251,12 @@ class ApproxSm(torch.nn.Module):
     Iterative smoothing via fixed-point iteration: g = (1-α)f + α*A*g
     where A is a row-stochastic adjacency matrix for a 1D chain.
     """
-    def __init__(self, alpha=0.5, num_steps=10):
+    def __init__(self, alpha="trainable", num_steps=10):
         super().__init__()
         self.num_steps = int(num_steps)
         
         if alpha == 'trainable':
-            self._raw = torch.nn.Parameter(torch.tensor(0.0))
+            self._raw = torch.nn.Parameter(torch.log(torch.tensor(alpha / (1 - alpha), dtype=torch.float32)))
             self.register_buffer('_alpha_fixed', None)
         else:
             assert 0.0 <= float(alpha) < 1.0, "alpha must be in [0, 1)"
@@ -341,7 +341,7 @@ class ExactSm(torch.nn.Module):
     def __init__(self, alpha=0.5):
         super().__init__()
         if alpha == 'trainable':
-            self._raw = torch.nn.Parameter(torch.tensor(0.0))  # sigmoid -> (0,1)
+            self._raw = torch.nn.Parameter(torch.log(torch.tensor(alpha / (1 - alpha), dtype=torch.float32)))
             self.register_buffer('_alpha_fixed', None)
         else:
             a = float(alpha)
@@ -385,7 +385,7 @@ class SmMILPooling(torch.nn.Module):
     Implements attention-based pooling with optional smoothing via graph convolution.
     Based on: https://github.com/Franblueee/SmMIL
     """
-    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, 
+    def __init__(self, in_features, temp=1.0, sm_alpha="trainable", 
                  sm_steps=10, sm_where='early'):
         super().__init__()
         self.in_features = in_features
@@ -425,6 +425,7 @@ class SmMILPooling(torch.nn.Module):
         """
         
         # early mode: Smooth the input embeddings x before the MLP
+        alpha = torch.sigmoid(self.raw_alpha)
         if self.sm_where == 'early':
             x_smoothed = torch.cat([
                 self.sm_layer_approx(x_i, neighbors=neighbors, self_loop=False) 
