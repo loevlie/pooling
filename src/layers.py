@@ -246,74 +246,74 @@ class TransformerBasedPooling(torch.nn.Module):
         return x, attn_weights
 
 
-def _neighbor_avg_chain_k(g: torch.Tensor, radius: int = 1, self_loop: bool = False) -> torch.Tensor:
-    """
-    One neighbor-average on a 1-D chain with k neighbors per side, using slicing only.
-    g: (S,) or (S,d)
-    """
-    S = g.size(0)
-    if S <= 1 or radius <= 0:
-        return g.clone()
-
-    # work in (S,d)
-    squeeze = False
-    if g.dim() == 1:
-        g = g.unsqueeze(1)
-        squeeze = True
-
-    device, dtype = g.device, g.dtype
-    agg = torch.zeros_like(g)                 # (S,d)
-    deg = torch.zeros((S, 1), device=device, dtype=dtype)  # (S,1)
-
-    if self_loop:
-        agg += g
-        deg += 1.0
-
-    # left/right neighbors via slicing (no wrap)
-    for k in range(1, radius + 1):
-        # left neighbor at distance k: contributes to positions [k:S]
-        agg[k:]  += g[:-k]
-        deg[k:]  += 1.0
-
-        # right neighbor at distance k: contributes to positions [0:S-k]
-        agg[:-k] += g[k:]
-        deg[:-k] += 1.0
-
-    avg = agg / deg.clamp_min(1e-12)
-    return avg.squeeze(1) if squeeze else avg
-
-
 class ApproxSm(torch.nn.Module):
     """
-    Jacobi-like smoothing for a single bag:
-        g_{t+1} = (1 - alpha) * f + alpha * avg_k(g_t)
+    Iterative smoothing via fixed-point iteration: g = (1-α)f + α*A*g
+    where A is a row-stochastic adjacency matrix for a 1D chain.
     """
     def __init__(self, alpha=0.5, num_steps=10):
         super().__init__()
         self.num_steps = int(num_steps)
+        
         if alpha == 'trainable':
-            self._raw = torch.nn.Parameter(torch.tensor(0.0))      # sigmoid -> (0,1)
+            self._raw = torch.nn.Parameter(torch.tensor(0.0))
             self.register_buffer('_alpha_fixed', None)
         else:
-            a = float(alpha); assert 0.0 <= a < 1.0
+            assert 0.0 <= float(alpha) < 1.0, "alpha must be in [0, 1)"
             self._raw = None
-            self.register_buffer('_alpha_fixed', torch.tensor(a))
+            self.register_buffer('_alpha_fixed', torch.tensor(float(alpha)))
 
     def _alpha(self):
         return torch.sigmoid(self._raw) if self._raw is not None else self._alpha_fixed
 
     def forward(self, f: torch.Tensor, neighbors: int = 1, self_loop: bool = False) -> torch.Tensor:
         """
-        f: (S,) or (S,d) logits/features for one bag
-        neighbors: k (radius) of neighbors on each side
-        self_loop: include the element itself in the average
+        Args:
+            f: (S,) or (S, d) - signal to smooth
+            neighbors: radius of neighborhood (k-neighbors on each side)
+            self_loop: include position itself in its neighborhood
+        Returns:
+            g: (S,) or (S, d) - smoothed signal
         """
         alpha = self._alpha()
+        S = f.size(0)
+        
+        if S <= 1 or neighbors <= 0:
+            return f.clone()
+        
+        squeeze = f.dim() == 1
+        if squeeze:
+            f = f.unsqueeze(1)
+        
         g = f.clone()
         for _ in range(self.num_steps):
-            avg = _neighbor_avg_chain_k(g, radius=neighbors, self_loop=self_loop)
-            g = (1.0 - alpha) * f + alpha * avg
-        return g
+            Ag = self._neighbor_average(g, neighbors, self_loop)
+            g = (1.0 - alpha) * f + alpha * Ag
+        
+        return g.squeeze(1) if squeeze else g
+    
+    def _neighbor_average(self, g: torch.Tensor, radius: int, self_loop: bool) -> torch.Tensor:
+        """Compute A*g where A is adjacency for 1D chain."""
+        S, d = g.shape
+        
+        agg = torch.zeros_like(g)
+        deg = torch.zeros((S, 1), device=g.device, dtype=g.dtype)
+        
+        if self_loop:
+            agg += g
+            deg += 1.0
+        
+        # Add contributions from k-neighbors on each side
+        for k in range(1, radius + 1):
+            # Left neighbors: position i gets contribution from i-k
+            agg[k:] += g[:-k]
+            deg[k:] += 1.0
+            
+            # Right neighbors: position i gets contribution from i+k
+            agg[:-k] += g[k:]
+            deg[:-k] += 1.0
+        
+        return agg / deg.clamp_min(1e-12)
 
 
 def _build_chain_A(length: int, radius: int = 1, self_loop: bool = False, *, device=None, dtype=None):
@@ -385,21 +385,31 @@ class SmMILPooling(torch.nn.Module):
     Implements attention-based pooling with optional smoothing via graph convolution.
     Based on: https://github.com/Franblueee/SmMIL
     """
-    def __init__(self, in_features, temp=1.0, sm_alpha="trainable", 
-                 sm_steps=10):
+    def __init__(self, in_features, temp=1.0, sm_alpha=0.5, 
+                 sm_steps=10, sm_where='early'):
         super().__init__()
         self.in_features = in_features
-        # self.temp = temp
+        self.temp = temp
         self.sm_alpha = sm_alpha
-        # self.sm_mode = sm_mode
         self.sm_steps = sm_steps
+        self.sm_where = sm_where
+        
+        # Build MLP layers
+        fc1 = torch.nn.Linear(in_features=in_features, out_features=128)
+        fc2 = torch.nn.Linear(in_features=128, out_features=1)
+        
+        # Apply spectral normalization for early mode
+        if sm_where == 'early':
+            fc1 = torch.nn.utils.parametrizations.spectral_norm(fc1)
+            fc2 = torch.nn.utils.parametrizations.spectral_norm(fc2)
+        
         self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(in_features=in_features, out_features=128),
+            fc1,
             torch.nn.Tanh(),
-            torch.nn.Linear(in_features=128, out_features=1),
+            fc2,
         )
-        # self.sm_layer_approx = ApproxSm(alpha=self.sm_alpha, num_steps=self.sm_steps)
-        self.sm_layer_exact = ExactSm(alpha=self.sm_alpha)
+        
+        self.sm_layer_approx = ApproxSm(alpha=self.sm_alpha, num_steps=self.sm_steps)
         
     def forward(self, x, lengths, neighbors=1):
         """
@@ -407,41 +417,39 @@ class SmMILPooling(torch.nn.Module):
         
         Args:
             x: Tensor of shape (N, d) with all instance embeddings from a batch of bags concatenated end-to-end.
-               N = sum_i S_i, where S_i is the number of instances in bag i, and d is the embedding dimension.
-               Instances belonging to each bag must be contiguous in `x` and in the same order as `lengths`.
             lengths: Sequence[int] or 1D tensor with per-bag instance counts (S_1, S_2, ..., S_B).
-                     Must satisfy sum(lengths) == N. Each S_i must be >= 1. No padding is expected; empty bags are not supported.
         
         Returns:
             context_vectors: Tensor of shape (B, d) with weighted sum of instances per bag.
-                             Weights are attention distributions over instances that sum to 1 within each bag.
-            attn_weights: Tensor of shape (N, 1) with attention weights for every instance across all bags,
-                          stacked in the same order as `x`. For each bag i, the S_i weights are obtained
-                          by a softmax over that bag’s instances (temperature-scaled by `self.temp`) and thus sum to 1 within the bag.
+            attn_weights: Tensor of shape (N, 1) with attention weights for every instance.
         """
-        # Starting with only the late implementation for now
         
-        attn_logits = self.mlp(x)
-        # The code below checks that the approx solution matches the exact solution
-        # with torch.no_grad():
-        #     logits = self.mlp(x)  # (N,1)
-        #     approx_chunks = []
-        #     exact_chunks  = []
-
-        #     offset = 0
-        #     for b, L in enumerate(lengths):
-        #         li = logits[offset:offset+L, 0]                  # (L,)
-        #         g_approx = self.sm_layer_approx(li, neighbors=neighbors, self_loop=False)  # (L,)
-        #         g_exact  = self.sm_layer_exact(li, neighbors=neighbors, self_loop=False)  # (L,)
-        #         approx_chunks.append(g_approx.unsqueeze(1))
-        #         exact_chunks .append(g_exact.unsqueeze(1))
-                # diff = (g_approx - g_exact)
-                # print(f"[bag {b}] L={L}  ||approx-exact||_2={diff.norm().item():.6f}  "
-                #     f"max|diff|={diff.abs().max().item():.6f}")
-                # offset += L
-        attn_logits_smoothed = torch.cat([self.sm_layer_exact(logits_i) for logits_i in torch.split(attn_logits, lengths)])
-        attn_weights = torch.cat([torch.nn.functional.softmax(smlogits_i/self.temp, dim=0) for smlogits_i in torch.split(attn_logits_smoothed, lengths)])
+        # early mode: Smooth the input embeddings x before the MLP
+        if self.sm_where == 'early':
+            x_smoothed = torch.cat([
+                self.sm_layer_approx(x_i, neighbors=neighbors, self_loop=False) 
+                for x_i in torch.split(x, lengths)
+            ])
+            attn_logits = self.mlp(x_smoothed)
+        else:
+            # Late mode: smooth after MLP
+            attn_logits = self.mlp(x)
+            attn_logits = torch.cat([
+                self.sm_layer_approx(logits_i, neighbors=neighbors, self_loop=False) 
+                for logits_i in torch.split(attn_logits, lengths)
+            ])
+        
+        # Compute attention weights via softmax
+        attn_weights = torch.cat([
+            torch.nn.functional.softmax(logits_i / self.temp, dim=0) 
+            for logits_i in torch.split(attn_logits, lengths)
+        ])
+        
+        # Aggregate: weighted sum using ORIGINAL x (not smoothed)
         attn_weighted_x = attn_weights * x
-        context_vectors = torch.cat([torch.sum(attn_weighted_x_i, dim=0, keepdim=True) for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)])
+        context_vectors = torch.cat([
+            torch.sum(attn_weighted_x_i, dim=0, keepdim=True) 
+            for attn_weighted_x_i in torch.split(attn_weighted_x, lengths)
+        ])
 
         return context_vectors, attn_weights
