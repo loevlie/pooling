@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=smmil_sweep
-#SBATCH --array=0-319%10
+#SBATCH --array=0-319%12
 #SBATCH --gres=gpu:1
 #SBATCH --mem=16g
 #SBATCH --ntasks=4
 #SBATCH --time=168:00:00
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu,hugheslab
 #SBATCH --output=/cluster/tufts/hugheslab/dloevl01/slurmlog/out/smmilEarly_%A_%a.out
 #SBATCH --error=/cluster/tufts/hugheslab/dloevl01/slurmlog/err/smmilEarly_%A_%a.err
 
