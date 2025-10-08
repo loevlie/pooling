@@ -155,9 +155,17 @@ def format_timedelta(td):
         return f"{minutes}m"
 
 
-def get_current_epoch(exp_dir, lr, wd, n_train, seed=1001, criterion='L1', pooling='smMILattentionEarly', embedding_level=True):
+def get_current_epoch(exp_dir, lr, wd, n_train, seed=1001, criterion='L1', pooling='smMILattentionEarly', embedding_level=None):
     """Get current epoch from CSV file if it exists."""
     try:
+        # Auto-detect level from exp_dir if not specified
+        if embedding_level is None:
+            exp_dir_str = str(exp_dir).lower()
+            if 'instance' in exp_dir_str:
+                embedding_level = False
+            else:
+                embedding_level = True
+
         # Construct expected filename
         level_suffix = "embedding_level" if embedding_level else "instance_level"
         model_name = f"criterion={criterion}_lr={lr}_pooling={pooling}_seed={seed}_wd_{wd}_N_{n_train}_{level_suffix}.csv"
@@ -165,7 +173,13 @@ def get_current_epoch(exp_dir, lr, wd, n_train, seed=1001, criterion='L1', pooli
         csv_path = Path(exp_dir) / model_name
 
         if not csv_path.exists():
-            return None
+            # Try the other level as fallback
+            level_suffix = "instance_level" if embedding_level else "embedding_level"
+            model_name = f"criterion={criterion}_lr={lr}_pooling={pooling}_seed={seed}_wd_{wd}_N_{n_train}_{level_suffix}.csv"
+            csv_path = Path(exp_dir) / model_name
+
+            if not csv_path.exists():
+                return None
 
         # Read CSV and get last epoch
         df = pd.read_csv(csv_path)
