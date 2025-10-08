@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timedelta
+import pandas as pd
 
 
 def parse_log_line(line):
@@ -154,7 +155,30 @@ def format_timedelta(td):
         return f"{minutes}m"
 
 
-def summarize_jobs(jobs, check_slurm=False):
+def get_current_epoch(exp_dir, lr, wd, n_train, seed=1001, criterion='L1', pooling='smMILattentionEarly', embedding_level=True):
+    """Get current epoch from CSV file if it exists."""
+    try:
+        # Construct expected filename
+        level_suffix = "embedding_level" if embedding_level else "instance_level"
+        model_name = f"criterion={criterion}_lr={lr}_pooling={pooling}_seed={seed}_wd_{wd}_N_{n_train}_{level_suffix}.csv"
+
+        csv_path = Path(exp_dir) / model_name
+
+        if not csv_path.exists():
+            return None
+
+        # Read CSV and get last epoch
+        df = pd.read_csv(csv_path)
+        if 'epoch' not in df.columns or len(df) == 0:
+            return None
+
+        return int(df['epoch'].max())
+
+    except Exception as e:
+        return None
+
+
+def summarize_jobs(jobs, check_slurm=False, exp_dir=None, n_train=None):
     """Summarize jobs by LR and WD combinations."""
     # Group by (lr, wd)
     combinations = defaultdict(list)
@@ -177,6 +201,11 @@ def summarize_jobs(jobs, check_slurm=False):
                 job['status'] = 'FINISHED' if check_slurm else 'UNKNOWN'
                 job['runtime'] = None
 
+            # Get current epoch if exp_dir provided
+            if exp_dir and n_train:
+                current_epoch = get_current_epoch(exp_dir, job['lr'], job['weight_decay'], n_train)
+                job['current_epoch'] = current_epoch
+
             combinations[key].append(job)
 
     return combinations
@@ -186,6 +215,7 @@ def main():
     parser = argparse.ArgumentParser(description="Parse command logs and extract job info")
     parser.add_argument("log_file", type=str, help="Path to command log file")
     parser.add_argument("--N_train", type=int, required=True, help="N_train value to filter by")
+    parser.add_argument("--exp-dir", type=str, default=None, help="Experiments directory to check current epoch")
     parser.add_argument("--check-slurm", action="store_true", help="Check job status via squeue")
     parser.add_argument("--verbose", action="store_true", help="Show detailed information")
     args = parser.parse_args()
@@ -209,7 +239,7 @@ def main():
     print()
 
     # Summarize by combinations
-    combinations = summarize_jobs(jobs, check_slurm=args.check_slurm)
+    combinations = summarize_jobs(jobs, check_slurm=args.check_slurm, exp_dir=args.exp_dir, n_train=args.N_train)
 
     # Count status
     status_counts = defaultdict(int)
@@ -231,31 +261,46 @@ def main():
             print(f"  {status_label}: {count}")
         print()
 
-    print("="*90)
+    print("="*110)
     print(f"LR/WD COMBINATIONS (N_train = {args.N_train})")
-    print("="*90)
+    print("="*110)
 
-    if args.check_slurm:
-        print(f"{'LR':<12} {'WD':<12} {'Status':<12} {'Runtime':<12} {'Job ID'}")
-        print("-"*90)
+    if args.check_slurm or args.exp_dir:
+        header = f"{'LR':<12} {'WD':<12}"
+        if args.check_slurm:
+            header += f" {'Status':<12} {'Runtime':<12}"
+        if args.exp_dir:
+            header += f" {'Epoch':<12}"
+        header += f" {'Job ID'}"
+        print(header)
+        print("-"*110)
     else:
         print(f"{'LR':<15} {'WD':<15} {'# Jobs':<10} {'Job IDs'}")
-        print("-"*90)
+        print("-"*110)
 
     for (lr, wd), job_list in sorted(combinations.items()):
-        if args.check_slurm:
+        if args.check_slurm or args.exp_dir:
             for job in job_list:
-                status = job.get('status', 'UNKNOWN')
-                status_label = {
-                    'R': 'RUNNING',
-                    'PD': 'PENDING',
-                    'FINISHED': 'FINISHED'
-                }.get(status, status)
+                line = f"{lr:<12.6f} {wd:<12.6e}"
 
-                runtime_str = job.get('runtime', 'N/A') if job.get('runtime') else 'N/A'
+                if args.check_slurm:
+                    status = job.get('status', 'UNKNOWN')
+                    status_label = {
+                        'R': 'RUNNING',
+                        'PD': 'PENDING',
+                        'FINISHED': 'FINISHED'
+                    }.get(status, status)
+                    runtime_str = job.get('runtime', 'N/A') if job.get('runtime') else 'N/A'
+                    line += f" {status_label:<12} {runtime_str:<12}"
+
+                if args.exp_dir:
+                    current_epoch = job.get('current_epoch')
+                    epoch_str = f"{current_epoch}/1000" if current_epoch is not None else "N/A"
+                    line += f" {epoch_str:<12}"
+
                 job_id = job['job_id']
-
-                print(f"{lr:<12.6f} {wd:<12.6e} {status_label:<12} {runtime_str:<12} {job_id}")
+                line += f" {job_id}"
+                print(line)
         else:
             job_ids_str = ', '.join([j['job_id'] for j in job_list])
             print(f"{lr:<15.6f} {wd:<15.6e} {len(job_list):<10} {job_ids_str}")
@@ -269,23 +314,28 @@ def main():
         print("="*70)
         print("DETAILED JOB INFORMATION")
         print("="*70)
-        for job in jobs:
-            print(f"Job ID: {job['job_id']}")
-            print(f"  Timestamp: {job['timestamp']}")
-            print(f"  N_train: {job.get('N_train', 'N/A')}")
-            print(f"  LR: {job.get('lr', 'N/A')}")
-            print(f"  WD: {job.get('weight_decay', 'N/A')}")
-            if args.check_slurm and 'status' in job:
-                status_label = {
-                    'R': 'RUNNING',
-                    'PD': 'PENDING',
-                    'FINISHED': 'FINISHED'
-                }.get(job['status'], job['status'])
-                print(f"  Status: {status_label}")
-                if job.get('runtime'):
-                    print(f"  Runtime: {job['runtime']}")
-            print(f"  Command: {job['command'][:100]}...")
-            print()
+        for (lr, wd), job_list in sorted(combinations.items()):
+            for job in job_list:
+                print(f"Job ID: {job['job_id']}")
+                print(f"  Timestamp: {job['timestamp']}")
+                print(f"  N_train: {job.get('N_train', 'N/A')}")
+                print(f"  LR: {job.get('lr', 'N/A')}")
+                print(f"  WD: {job.get('weight_decay', 'N/A')}")
+                if args.check_slurm and 'status' in job:
+                    status_label = {
+                        'R': 'RUNNING',
+                        'PD': 'PENDING',
+                        'FINISHED': 'FINISHED'
+                    }.get(job['status'], job['status'])
+                    print(f"  Status: {status_label}")
+                    if job.get('runtime'):
+                        print(f"  Runtime: {job['runtime']}")
+                if args.exp_dir and 'current_epoch' in job:
+                    current_epoch = job.get('current_epoch')
+                    if current_epoch is not None:
+                        print(f"  Current Epoch: {current_epoch}/1000")
+                print(f"  Command: {job['command'][:100]}...")
+                print()
 
 
 if __name__ == "__main__":
