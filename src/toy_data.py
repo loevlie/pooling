@@ -41,12 +41,20 @@ if __name__=="__main__":
 
     os.makedirs(args.experiments_directory, exist_ok=True)
 
-    # Check if CSV already exists and skip if so
+    # Check if CSV already exists and has run more than 100 epochs
     csv_path = f"{args.experiments_directory}/{args.model_name}.csv"
     if os.path.exists(csv_path):
-        print(f"CSV file already exists: {csv_path}")
-        print(f"Skipping hyperparameter combination: {args.model_name}")
-        exit(0)
+        try:
+            existing_df = pd.read_csv(csv_path)
+            num_epochs = len(existing_df)
+            if num_epochs > 100:
+                print(f"CSV file already exists with {num_epochs} epochs: {csv_path}")
+                print(f"Skipping hyperparameter combination: {args.model_name}")
+                exit(0)
+            else:
+                print(f"CSV file exists but only has {num_epochs} epochs (≤100). Rerunning...")
+        except Exception as e:
+            print(f"Error reading existing CSV: {e}. Rerunning...")
 
     X_train, lengths_train, u_train, y_train = utils.generate_toy_data(args.N_train, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_train)
     X_val, lengths_val, u_val, y_val = utils.generate_toy_data(args.N_val, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_val)
