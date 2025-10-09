@@ -182,17 +182,17 @@ def train_one_epoch(model, criterion, optimizer, dataloader, lr_scheduler=None):
     return metrics
 
 class ToyDataset(torch.utils.data.Dataset):
-    
+
     def __init__(self, X, lengths, y):
         super().__init__()
-        self.X = X
+        # Pre-split data once during initialization to avoid O(N^2) scaling
+        self.X_split = list(torch.split(X, lengths))
         self.lengths = lengths
         self.y = y
 
     def __len__(self):
         return len(self.lengths)
-    
+
     def __getitem__(self, index):
-        x_i = torch.split(self.X, self.lengths)[index]
-        return x_i, self.lengths[index], self.y[index]
+        return self.X_split[index], self.lengths[index], self.y[index]
     

@@ -38,8 +38,15 @@ if __name__=="__main__":
     args = parser.parse_args()
     
     torch.manual_seed(args.seed)
-    
+
     os.makedirs(args.experiments_directory, exist_ok=True)
+
+    # Check if CSV already exists and skip if so
+    csv_path = f"{args.experiments_directory}/{args.model_name}.csv"
+    if os.path.exists(csv_path):
+        print(f"CSV file already exists: {csv_path}")
+        print(f"Skipping hyperparameter combination: {args.model_name}")
+        exit(0)
 
     X_train, lengths_train, u_train, y_train = utils.generate_toy_data(args.N_train, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_train)
     X_val, lengths_val, u_val, y_val = utils.generate_toy_data(args.N_val, delta=args.delta, deltaS=args.deltaS, seed=args.data_seed_val)
@@ -62,6 +69,8 @@ if __name__=="__main__":
     else:
         model = models.ClfPool(in_features=768, out_features=1, instance_conv=args.instance_conv, kernel_size=args.kernel_size, pooling=args.pooling, use_pos_embedding=args.use_pos_embedding)
     model.to(device)
+
+    print(f"args.alpha = {args.alpha}, args.beta = {args.beta}")
         
     if args.criterion == "ERM":
         criterion = losses.ERMLoss(criterion=torch.nn.BCEWithLogitsLoss())
