@@ -47,7 +47,7 @@ if __name__=="__main__":
         try:
             existing_df = pd.read_csv(csv_path)
             num_epochs = len(existing_df)
-            if num_epochs > 100:
+            if num_epochs > 900:
                 print(f"CSV file already exists with {num_epochs} epochs: {csv_path}")
                 print(f"Skipping hyperparameter combination: {args.model_name}")
                 exit(0)
